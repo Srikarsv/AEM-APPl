@@ -1,0 +1,140 @@
+package com.adobe.aem.guides.wknd.core.models;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import org.apache.sling.api.SlingHttpServletRequest;
+import org.apache.sling.api.SlingHttpServletResponse;
+import org.apache.sling.api.resource.*;
+import org.apache.sling.api.servlets.SlingAllMethodsServlet;
+import org.osgi.service.component.annotations.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.servlet.Servlet;
+import javax.servlet.ServletException;
+import java.io.IOException;
+import java.util.*;
+
+@Component(service = Servlet.class,
+        property = {
+                "sling.servlet.paths=/bin/checkFlagUniformity",
+                "sling.servlet.methods=GET",
+                "sling.servlet.methods=POST"
+        })
+public class CheckFlagUniformityServlet extends SlingAllMethodsServlet {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CheckFlagUniformityServlet.class);
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    private static final List<String> FLAG_KEYS = Arrays.asList(
+            "spwtaem:deployed_dev_en",
+            "spwtaem:deployed_dev_es",
+            "spwtaem:deployed_sit_en",
+            "spwtaem:deployed_sit_es",
+            "certified_en",
+            "certified_es"
+    );
+
+    @Override
+    protected void doGet(SlingHttpServletRequest request, SlingHttpServletResponse response) throws ServletException, IOException {
+        String[] paths = request.getParameterValues("path");
+
+        if (paths == null || paths.length == 0) {
+            sendJsonResponse(response, SlingHttpServletResponse.SC_BAD_REQUEST, Map.of("error", "Missing 'path' parameters."));
+            return;
+        }
+
+        Map<String, Map<String, Boolean>> flagMap = new HashMap<>();
+
+        try {
+            for (String path : paths) {
+                Resource metadataResource = getMetadataResource(request.getResourceResolver(), path);
+                if (metadataResource == null) {
+                    sendJsonResponse(response, SlingHttpServletResponse.SC_BAD_REQUEST, Map.of("error", "Metadata not found for " + path));
+                    return;
+                }
+
+                ValueMap properties = metadataResource.getValueMap();
+                Map<String, Boolean> flags = new HashMap<>();
+
+                for (String key : FLAG_KEYS) {
+                    flags.put(key, properties.get(key, Boolean.FALSE));
+                }
+                flagMap.put(path, flags);
+            }
+
+            // Check uniformity for each flag
+            Map<String, Object> result = new HashMap<>();
+            for (String flag : FLAG_KEYS) {
+                boolean firstValue = flagMap.get(paths[0]).get(flag);
+                boolean allSame = Arrays.stream(paths).allMatch(p -> flagMap.get(p).get(flag) == firstValue);
+                result.put(flag, allSame ? (firstValue ? "allTrue" : "allFalse") : "mixed");
+            }
+
+            sendJsonResponse(response, SlingHttpServletResponse.SC_OK, result);
+        } catch (Exception e) {
+            LOG.error("Error in GET uniformity check", e);
+            sendJsonResponse(response, SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR, Map.of("error", "Internal server error"));
+        }
+    }
+
+    @Override
+    protected void doPost(SlingHttpServletRequest request, SlingHttpServletResponse response) throws ServletException, IOException {
+        String[] paths = request.getParameterValues("path");
+        String statusKey = request.getParameter("status");
+        String action = request.getParameter("action");
+
+        if (paths == null || paths.length == 0 || statusKey == null || action == null) {
+            sendJsonResponse(response, SlingHttpServletResponse.SC_BAD_REQUEST, Map.of("error", "Missing required parameters: path[], status, action"));
+            return;
+        }
+
+        boolean statusValue = action.toLowerCase().contains("certify");
+        Map<String, String> result = new HashMap<>();
+
+        ResourceResolver resolver = request.getResourceResolver();
+
+        for (String path : paths) {
+            try {
+                Resource metadataResource = getMetadataResource(resolver, path);
+                if (metadataResource != null) {
+                    ModifiableValueMap properties = metadataResource.adaptTo(ModifiableValueMap.class);
+                    if (properties != null) {
+                        properties.put(statusKey, statusValue);
+                        result.put(path, "updated");
+                    } else {
+                        result.put(path, "metadata not modifiable");
+                    }
+                } else {
+                    result.put(path, "metadata not found");
+                }
+            } catch (Exception e) {
+                LOG.error("Failed to update status for asset: {}", path, e);
+                result.put(path, "error: " + e.getMessage());
+            }
+        }
+
+        try {
+            resolver.commit();
+        } catch (PersistenceException e) {
+            LOG.error("Error committing changes", e);
+            sendJsonResponse(response, SlingHttpServletResponse.SC_INTERNAL_SERVER_ERROR, Map.of("error", "Failed to commit changes."));
+            return;
+        }
+
+        sendJsonResponse(response, SlingHttpServletResponse.SC_OK, result);
+    }
+
+    private Resource getMetadataResource(ResourceResolver resolver, String path) {
+        Resource asset = resolver.getResource(path);
+        if (asset != null) {
+            return asset.getChild("jcr:content/metadata");
+        }
+        return null;
+    }
+
+    private void sendJsonResponse(SlingHttpServletResponse response, int statusCode, Map<String, ?> data) throws IOException {
+        response.setStatus(statusCode);
+        response.setContentType("application/json");
+        response.getWriter().write(GSON.toJson(data));
+    }
+}
